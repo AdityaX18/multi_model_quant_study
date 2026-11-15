@@ -1,0 +1,18 @@
+{
+  "name": "smoke",
+  "models": [
+    {"name": "qwen2.5-0.5b", "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF", "stem": "qwen2.5-0.5b-instruct",
+     "quants": ["q8_0", "q4_k_m"]}
+  ],
+  "reference_quant": "q8_0",
+  "items": {"simple": 12, "multiple": 6, "irrelevance": 8},
+  "temperatures": [0, 1.0],
+  "samples": 2,
+  "t0_repeats": 2,
+  "seed": 0,
+  "max_tokens": 200,
+  "top_logprobs": 5,
+  "ctx": 4096,
+  "gpu_layers": 0,
+  "parallel": 2
+}

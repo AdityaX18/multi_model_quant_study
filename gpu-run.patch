@@ -1,0 +1,457 @@
+diff --git a/Dockerfile b/Dockerfile
+index ca685b8..3c812ff 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,6 +1,6 @@
+ # Same job in a container (needs the NVIDIA container toolkit on the host):
+ #   docker build -t quant-toolcall .
+-#   docker run --gpus all -v $PWD/results:/app/results -v $PWD/models:/app/models quant-toolcall configs/l40_full.json
++#   docker run --gpus all -v $PWD/results:/app/results -v $PWD/models:/app/models quant-toolcall configs/l40_run_a.json
+ # Not yet tested on a GPU host: if the build fails, use scripts/setup_gpu.sh instead.
+ FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+ RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential python3 python3-venv \
+@@ -15,4 +15,4 @@ RUN git clone https://github.com/ggml-org/llama.cpp .cache/llama.cpp && git -C .
+ COPY . .
+ ENV LLAMA_SERVER=/app/.cache/llama.cpp/build/bin/llama-server
+ ENTRYPOINT [".venv/bin/python", "-m", "harness.pipeline", "--config"]
+-CMD ["configs/l40_full.json"]
++CMD ["configs/l40_run_a.json"]
+diff --git a/README.md b/README.md
+index e3b8a76..7741580 100644
+--- a/README.md
++++ b/README.md
+@@ -7,9 +7,10 @@ quantization levels, 840 BFCL items, four temperatures with repeated samples.
+ ## One command
+ ```bash
+ python -m harness.pipeline --config configs/smoke.json      # laptop, ~6 min, 208 generations
+-python -m harness.pipeline --config configs/l40_full.json   # big GPU, 299,880 generations (RUN_ON_GPU.md)
++python -m harness.pipeline --config configs/l40_run_a.json   # big GPU: 1.5B + 3B, 199,920 generations
++python -m harness.pipeline --config configs/l40_run_b.json   # big GPU: 7B, 99,960 generations (RUN_ON_GPU.md)
+ ```
+-Stages: check → fetch → preflight → generate → score → analyse → pack. Re-running skips finished work.
++Stages: check → preflight → generate → score → analyse → pack. Re-running skips finished work.
+ 
+ ## Folder map
+ | Path | What it does | Author |
+@@ -32,7 +33,7 @@ Stages: check → fetch → preflight → generate → score → analyse → pac
+ 
+ ## Data flow
+ ```
+-config ──► fetch ──► models/*.gguf
++config ──► one GGUF at a time into models/ (deleted after use when "delete_after_use" is set)
+                          │
+ items (bfcl.py) ──► generate (run_grid.py + llama.py) ──► results/<run>/generations.jsonl   raw outputs
+                                                               │
+diff --git a/RUN_ON_GPU.md b/RUN_ON_GPU.md
+index 3da36f5..8c3e187 100644
+--- a/RUN_ON_GPU.md
++++ b/RUN_ON_GPU.md
+@@ -1,35 +1,43 @@
+-# Running the full grid on a big GPU (for Deepesh)
++# Running the grid on a big GPU (for Deepesh)
+ 
+-What it is: 3 Qwen2.5 sizes (1.5B, 3B, 7B) × 7 quantization levels (fp16 down to q2_k) × 840 BFCL
+-tool-calling items × 4 temperatures with repeated samples = 299,880 generations through llama.cpp.
+-No API keys. Downloads ~78 GB of GGUF files from Hugging Face. Writes everything under `results/`.
++Two separate runs, so each fits comfortably and you can do them on different days:
++
++| Run | Config | Models | Generations | Download in total | Disk at any moment |
++|---|---|---|---|---|---|
++| A | `configs/l40_run_a.json` | Qwen2.5 1.5B and 3B, 7 quant levels each | 199,920 | 32 GB | under 7 GB |
++| B | `configs/l40_run_b.json` | Qwen2.5 7B, 7 quant levels | 99,960 | 47 GB | under 16 GB |
++
++Each GGUF file is downloaded right before it is used and deleted as soon as its outputs are saved
++(`"delete_after_use": true`), so disk never holds more than one file. GPU memory: the largest model is
++15 GB of weights plus about 4 GB of cache at 32 parallel requests, so about 20 GB of the 48.
++
++## How the GPU is used
++- llama.cpp is built with CUDA (`-DGGML_CUDA=ON`) and every layer is on the GPU (`"gpu_layers": 99`).
++- Batching: `"parallel": 32` keeps 32 requests in flight. llama-server decodes all active requests in
++  one batched forward pass per token (continuous batching), so this is a batch size of 32.
++- The log prints generations per second and GPU utilisation every 200 generations. If utilisation sits
++  below ~90%, raise `"parallel"` to 64 in the config and re-run the same command (it resumes).
+ 
+ ## Needs
+-Linux, NVIDIA driver + CUDA toolkit (`nvcc --version` works), git, cmake, python3 with venv, ~80 GB free disk,
+-internet. No Hugging Face login or token: the Qwen GGUF repos are public.
++Linux, NVIDIA driver + CUDA toolkit (`nvcc --version` works), git, cmake, python3 with venv, internet.
++No Hugging Face login or token: the Qwen GGUF repos are public.
+ 
+ ## Steps
+ ```bash
+ git clone https://github.com/AdityaX18/multi_model_quant_study.git && cd multi_model_quant_study
+ bash scripts/setup_gpu.sh                 # builds llama.cpp with CUDA, venv, 5 tests should pass
+-nohup bash scripts/run_full.sh configs/l40_full.json > run.log 2>&1 &
+-tail -f run.log
++nohup bash scripts/run_full.sh configs/l40_run_a.json > run_a.log 2>&1 &
++tail -f run_a.log
+ ```
+-After ~10 minutes the log prints a `[preflight]` line with a time estimate. If it says STOP, send me
+-diff --git a/core/__init__.py b/core/__init__.py
+-index 35c47fd..1591c1b 100644
+---- a/core/__init__.py
+-+++ b/core/__init__.py
+-@@ -1,5 +1,5 @@.
++Later, for the 7B: `nohup bash scripts/run_full.sh configs/l40_run_b.json > run_b.log 2>&1 &`
++
++After a few minutes the log prints two `[preflight]` lines: how many layers went to the GPU, and a time
++estimate for the whole run. If it says STOP, or 0 layers were offloaded, send me the log and
++`results/l40-run-a/server-*.log`.
+ 
+ ## If you need the GPU back
+-Kill it any time. Re-running the same command resumes; nothing finished is redone. Models run in the
+-order 1.5B, 3B, 7B, so a partial run is still useful. To pack what exists so far:
+-`python -m harness.pipeline --config configs/l40_full.json --stages score pack`
++Kill it any time. Re-running the same command resumes; nothing finished is redone. To pack what exists
++so far: `python -m harness.pipeline --config configs/l40_run_a.json --stages score pack`
+ 
+ ## What to send back
+-`results/l40-full-v1.tar.gz` (the last line of the log prints its path and size).
+-
+-## Knobs
+-`"parallel": 16` in the config = requests in flight. If GPU utilisation (nvidia-smi) is below ~80%,
+-raise it to 32; if you see out-of-memory, lower it to 8.
++`results/l40-run-a.tar.gz` and later `results/l40-run-b.tar.gz` (the last log line prints the path).
+diff --git a/configs/l40_full.json b/configs/l40_full.json
+deleted file mode 100644
+index 9c65591..0000000
+--- a/configs/l40_full.json
++++ /dev/null
+@@ -1,22 +0,0 @@
+-{
+-  "name": "l40-full-v1",
+-  "models": [
+-    {"name": "qwen2.5-1.5b", "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF", "stem": "qwen2.5-1.5b-instruct",
+-     "quants": ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m", "q2_k"]},
+-    {"name": "qwen2.5-3b", "repo": "Qwen/Qwen2.5-3B-Instruct-GGUF", "stem": "qwen2.5-3b-instruct",
+-     "quants": ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m", "q2_k"]},
+-    {"name": "qwen2.5-7b", "repo": "Qwen/Qwen2.5-7B-Instruct-GGUF", "stem": "qwen2.5-7b-instruct",
+-     "quants": ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m", "q2_k"]}
+-  ],
+-  "reference_quant": "fp16",
+-  "items": {"simple": 400, "multiple": 200, "irrelevance": 240},
+-  "temperatures": [0, 0.3, 0.7, 1.0],
+-  "samples": 5,
+-  "t0_repeats": 2,
+-  "seed": 0,
+-  "max_tokens": 256,
+-  "top_logprobs": 5,
+-  "ctx": 4096,
+-  "gpu_layers": 99,
+-  "parallel": 16
+-}
+diff --git a/configs/l40_run_a.json b/configs/l40_run_a.json
+new file mode 100644
+index 0000000..cfd9e36
+--- /dev/null
++++ b/configs/l40_run_a.json
+@@ -0,0 +1,33 @@
++{
++  "name": "l40-run-a",
++  "models": [
++    {
++      "name": "qwen2.5-1.5b",
++      "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
++      "stem": "qwen2.5-1.5b-instruct",
++      "quants": ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m", "q2_k"]
++    },
++    {
++      "name": "qwen2.5-3b",
++      "repo": "Qwen/Qwen2.5-3B-Instruct-GGUF",
++      "stem": "qwen2.5-3b-instruct",
++      "quants": ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m", "q2_k"]
++    }
++  ],
++  "reference_quant": "fp16",
++  "items": {
++    "simple": 400,
++    "multiple": 200,
++    "irrelevance": 240
++  },
++  "temperatures": [0, 0.3, 0.7, 1.0],
++  "samples": 5,
++  "t0_repeats": 2,
++  "seed": 0,
++  "max_tokens": 256,
++  "top_logprobs": 5,
++  "ctx": 4096,
++  "gpu_layers": 99,
++  "parallel": 32,
++  "delete_after_use": true
++}
+diff --git a/configs/l40_run_b.json b/configs/l40_run_b.json
+new file mode 100644
+index 0000000..e525328
+--- /dev/null
++++ b/configs/l40_run_b.json
+@@ -0,0 +1,27 @@
++{
++  "name": "l40-run-b",
++  "models": [
++    {
++      "name": "qwen2.5-7b",
++      "repo": "Qwen/Qwen2.5-7B-Instruct-GGUF",
++      "stem": "qwen2.5-7b-instruct",
++      "quants": ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m", "q2_k"]
++    }
++  ],
++  "reference_quant": "fp16",
++  "items": {
++    "simple": 400,
++    "multiple": 200,
++    "irrelevance": 240
++  },
++  "temperatures": [0, 0.3, 0.7, 1.0],
++  "samples": 5,
++  "t0_repeats": 2,
++  "seed": 0,
++  "max_tokens": 256,
++  "top_logprobs": 5,
++  "ctx": 4096,
++  "gpu_layers": 99,
++  "parallel": 32,
++  "delete_after_use": true
++}
+diff --git a/harness/fetch_models.py b/harness/fetch_models.py
+index a354c8d..e33a23b 100644
+--- a/harness/fetch_models.py
++++ b/harness/fetch_models.py
+@@ -40,6 +40,21 @@ def fetch(repo: str, stem: str, quant: str, dest: Path = MODELS) -> Path:
+     return paths[0]
+ 
+ 
++def sizes(repo: str, stem: str, quants: list[str]) -> dict[str, int]:
++    """Bytes on disk for each quant level, read from the Hugging Face file listing (no download)."""
++    from huggingface_hub import list_repo_tree
++
++    tree = {f.path: f.size for f in list_repo_tree(repo) if f.path.endswith(".gguf")}
++    return {q: sum(tree[n] for n in files_for(list(tree), stem, q)) for q in quants}
++
++
++def remove(first_part: Path) -> None:
++    """Delete one quant level's file(s), all parts of a split file included."""
++    base = re.sub(r"(-\d{5}-of-\d{5})?\.gguf$", "", first_part.name)
++    for f in first_part.parent.glob(base + "*.gguf"):
++        f.unlink()
++
++
+ def main(argv=None) -> None:
+     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--repo", required=True)
+diff --git a/harness/pipeline.py b/harness/pipeline.py
+index 5fe25cd..dad9aea 100644
+--- a/harness/pipeline.py
++++ b/harness/pipeline.py
+@@ -1,12 +1,12 @@
+ """One command from nothing to results:
+ 
+-  python -m harness.pipeline --config configs/l40_full.json
++  python -m harness.pipeline --config configs/l40_run_a.json
+ 
+ Stages, in order (each one is skipped if its work is already on disk, so re-running is always safe):
+   check      llama-server found, GPU visible, items load
+-  fetch      download every GGUF in the config from Hugging Face into models/
+-  preflight  24 items on the first model: are tool calls coming back at all, and how long will the full run take
++  preflight  24 items on the first model: are tool calls coming back at all, how long will the full run take
+   generate   the full grid -> results/<name>/generations.jsonl            (harness/run_grid.py)
++             each GGUF is downloaded right before use; with "delete_after_use" it is deleted right after
+   score      re-grade every row from the raw output -> scored.jsonl       (harness/score.py)
+   analyse    tables and plots -> results/<name>/report/                    (core/analysis.py, YOURS)
+   pack       results/<name>.tar.gz, the one file to send back
+@@ -27,12 +27,12 @@ import time
+ from pathlib import Path
+ 
+ from . import bfcl
+-from .fetch_models import fetch
++from .fetch_models import sizes
+ from .run_grid import count, generate, items_for
+ from .score import score
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+-STAGES = ["check", "fetch", "preflight", "generate", "score", "analyse", "pack"]
++STAGES = ["check", "preflight", "generate", "score", "analyse", "pack"]
+ 
+ 
+ def load_config(path: str) -> dict:
+@@ -60,16 +60,7 @@ def stage_check(cfg: dict, out: Path) -> None:
+     print(f"[check] GPU: {meta['gpu']}   items: {len(items_for(cfg))}   generations planned: {n:,}")
+ 
+ 
+-def stage_fetch(cfg: dict) -> dict:
+-    paths = {}
+-    for m in cfg["models"]:
+-        for q in m["quants"]:
+-            paths[(m["name"], q)] = fetch(m["repo"], m["stem"], q)
+-            print(f"[fetch] {m['name']} {q}: {paths[(m['name'], q)].name}")
+-    return paths
+-
+-
+-def stage_preflight(cfg: dict, out: Path, paths: dict) -> None:
++def stage_preflight(cfg: dict, out: Path) -> None:
+     pf = out / "preflight.json"
+     if pf.exists():
+         print(f"[preflight] already done: {json.loads(pf.read_text())['summary']}")
+@@ -78,7 +69,7 @@ def stage_preflight(cfg: dict, out: Path, paths: dict) -> None:
+     small = dict(cfg, models=[dict(m, quants=[m["quants"][0]])],
+                  items={c: 8 for c in cfg["items"]}, temperatures=[0, max(cfg["temperatures"])], samples=2, t0_repeats=1)
+     t0 = time.time()
+-    gen = generate(small, out, paths, gen_name="preflight.jsonl")
++    gen = generate(small, out, gen_name="preflight.jsonl", keep_models=True)
+     secs = time.time() - t0
+     rows = [json.loads(line) for line in gen.read_text().splitlines()]
+     failed = sum(r["error"] == "request_failed" for r in rows)
+@@ -86,17 +77,20 @@ def stage_preflight(cfg: dict, out: Path, paths: dict) -> None:
+     relevant = sum(r["category"] != "irrelevance" for r in rows)
+     per_gen = secs / max(len(rows), 1)
+     # crude: assume time per generation grows with file size; good enough to decide whether it fits a night
+-    ref_size = paths[(m["name"], m["quants"][0])].stat().st_size
+-    est = 0.0
++    size = {mm["name"]: sizes(mm["repo"], mm["stem"], mm["quants"]) for mm in cfg["models"]}
++    ref_size = size[m["name"]][m["quants"][0]]
+     n_per_quant = count(dict(cfg, models=[dict(m, quants=["x"])]))
+-    for mm in cfg["models"]:
+-        for q in mm["quants"]:
+-            p = paths[(mm["name"], q)]
+-            size = sum(f.stat().st_size for f in p.parent.glob(p.name.replace("-00001-of-", "-*-of-")))
+-            est += n_per_quant * per_gen * max(size / ref_size, 0.3)
+-    summary = (f"{len(rows)} generations in {secs:.0f} s ({per_gen:.2f} s each incl. model load); "
++    est = sum(n_per_quant * per_gen * max(b / ref_size, 0.3) for mm in size.values() for b in mm.values())
++    total_gb = sum(b for mm in size.values() for b in mm.values()) / 1e9
++    peak_gb = max(b for mm in size.values() for b in mm.values()) / 1e9
++    disk = (f"disk: {peak_gb:.0f} GB peak (one file at a time, deleted after use)" if cfg.get("delete_after_use")
++            else f"disk: {total_gb:.0f} GB (all files kept)")
++    summary = (f"{len(rows)} generations in {secs:.0f} s ({per_gen:.2f} s each incl. download and model load); "
+                f"tool calls on {calls}/{relevant} non-irrelevance items; {failed} failed requests; "
+-               f"full run estimate {est / 3600:.1f} h (rough)")
++               f"full run estimate {est / 3600:.1f} h (rough, upper bound); {disk}")
++    log = out / f"server-{m['name']}-{m['quants'][0]}.log"
++    offload = [ln for ln in log.read_text(errors="ignore").splitlines() if "offloaded" in ln and "layers" in ln]
++    print(f"[preflight] GPU offload: {offload[-1].strip() if offload else 'no offload line in server log'}")
+     pf.write_text(json.dumps({"summary": summary, "seconds": secs, "rows": len(rows)}, indent=1))
+     print(f"[preflight] {summary}")
+     if failed > len(rows) * 0.1 or calls == 0:
+@@ -152,15 +146,12 @@ def main(argv=None) -> None:
+     out = ROOT / "results" / cfg["name"]
+     out.mkdir(parents=True, exist_ok=True)
+     t0 = time.time()
+-    paths = {}
+     if "check" in a.stages:
+         stage_check(cfg, out)
+-    if {"fetch", "preflight", "generate"} & set(a.stages):
+-        paths = stage_fetch(cfg)
+     if "preflight" in a.stages:
+-        stage_preflight(cfg, out, paths)
++        stage_preflight(cfg, out)
+     if "generate" in a.stages:
+-        generate(cfg, out, paths)
++        generate(cfg, out)
+     if "score" in a.stages:
+         stage_score(out)
+     if "analyse" in a.stages:
+diff --git a/harness/run_grid.py b/harness/run_grid.py
+index 0ab77e3..f73c14f 100644
+--- a/harness/run_grid.py
++++ b/harness/run_grid.py
+@@ -5,6 +5,11 @@ so a crashed job continues where it stopped (run the same command again).
+ 
+ Key = "<model>|<quant>|<item id>|<temperature>|<sample>".
+ 
++GPU use: llama-server is built with CUDA and every layer is offloaded ("gpu_layers": 99). "parallel": N
++opens N slots; the server decodes all active slots in ONE batched forward pass per token (continuous
++batching), so N requests in flight is a batch size of N on the GPU. The progress line prints GPU
++utilisation; if it sits well below 90%, raise "parallel".
++
+ Design choices that matter for the statistics (explained in README "Why the grid looks like this"):
+ - temperature 0 is run `t0_repeats` times (default 2). With several slots the server batches requests
+   together, and batching can change floating-point sums, so even greedy decoding can differ between
+@@ -18,12 +23,15 @@ Design choices that matter for the statistics (explained in README "Why the grid
+ from __future__ import annotations
+ 
+ import json
++import shutil
++import subprocess
+ import threading
+ import time
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ from pathlib import Path
+ 
+ from . import bfcl
++from .fetch_models import fetch, remove
+ from .llama import LlamaServer
+ from .score import score
+ 
+@@ -76,8 +84,25 @@ def run_one(srv: LlamaServer, cfg: dict, model: str, quant: str, it: dict, t: fl
+             "temperature": t, "sample": s, **verdict, **r}
+ 
+ 
+-def generate(cfg: dict, out: Path, model_paths: dict[tuple[str, str], Path], limit_items: int | None = None,
+-             gen_name: str = "generations.jsonl") -> Path:
++def gpu_line() -> str:
++    """'util 97%, 21034 MiB' from nvidia-smi, or '' on a machine without one."""
++    if not shutil.which("nvidia-smi"):
++        return ""
++    r = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
++                       capture_output=True, text=True)
++    try:
++        util, mem = r.stdout.strip().splitlines()[0].split(", ")
++        return f"  GPU {util}% {mem} MiB"
++    except (IndexError, ValueError):
++        return ""
++
++
++def generate(cfg: dict, out: Path, limit_items: int | None = None, gen_name: str = "generations.jsonl",
++             keep_models: bool | None = None) -> Path:
++    """Models are downloaded one quant level at a time, right before they are needed. With
++    "delete_after_use": true in the config the file is deleted as soon as its generations are on disk,
++    so peak disk use is one file (15 GB for the largest), not the whole ladder."""
++    delete = cfg.get("delete_after_use", False) if keep_models is None else not keep_models
+     gen_path = out / gen_name
+     done = done_keys(gen_path)
+     items = items_for(cfg)
+@@ -94,9 +119,10 @@ def generate(cfg: dict, out: Path, model_paths: dict[tuple[str, str], Path], lim
+                         if f"{m['name']}|{quant}|{it['id']}|{t}|{s}" not in done]
+                 if not todo:
+                     continue
++                path = fetch(m["repo"], m["stem"], quant)
+                 print(f"[generate] {m['name']} {quant}: {len(todo)} to do, {parallel} parallel", flush=True)
+                 t0 = time.time()
+-                with LlamaServer(model_paths[(m["name"], quant)], ctx=cfg.get("ctx", 4096), parallel=parallel,
++                with LlamaServer(path, ctx=cfg.get("ctx", 4096), parallel=parallel,
+                                  threads=cfg.get("threads"), gpu_layers=cfg.get("gpu_layers", 0),
+                                  binary=cfg.get("llama_server"), extra_args=cfg.get("server_args"),
+                                  log=out / f"server-{m['name']}-{quant}.log") as srv:
+@@ -110,5 +136,8 @@ def generate(cfg: dict, out: Path, model_paths: dict[tuple[str, str], Path], lim
+                             if i % 200 == 0 or i == len(todo):
+                                 rate = i / (time.time() - t0)
+                                 print(f"  {m['name']} {quant}: {i}/{len(todo)}  {rate:.1f} gen/s  "
+-                                      f"total {(time.time() - t_start) / 60:.1f} min", flush=True)
++                                      f"total {(time.time() - t_start) / 60:.1f} min{gpu_line()}", flush=True)
++                if delete:
++                    remove(path)
++                    print(f"[generate] deleted {path.name} to free disk", flush=True)
+     return gen_path
+diff --git a/scripts/run_full.sh b/scripts/run_full.sh
+index 23809d0..fa6a268 100755
+--- a/scripts/run_full.sh
++++ b/scripts/run_full.sh
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env bash
+ # The whole job in one line, safe to re-run after a crash (finished work is skipped):
+-#   nohup scripts/run_full.sh configs/l40_full.json > run.log 2>&1 &
++#   nohup scripts/run_full.sh configs/l40_run_a.json > run.log 2>&1 &
+ set -euo pipefail
+ cd "$(dirname "$0")/.."
+ export LLAMA_SERVER="${LLAMA_SERVER:-$PWD/.cache/llama.cpp/build/bin/llama-server}"
+ . .venv/bin/activate
+-python -m harness.pipeline --config "${1:-configs/l40_full.json}"
++python -m harness.pipeline --config "${1:-configs/l40_run_a.json}"
+diff --git a/scripts/setup_gpu.sh b/scripts/setup_gpu.sh
+index 8409962..980aad2 100755
+--- a/scripts/setup_gpu.sh
++++ b/scripts/setup_gpu.sh
+@@ -19,4 +19,4 @@ python -m pytest tests/test_harness.py -q
+ echo
+ echo "Ready. Run:"
+ echo "  export LLAMA_SERVER=$PWD/.cache/llama.cpp/build/bin/llama-server"
+-echo "  . .venv/bin/activate && python -m harness.pipeline --config configs/l40_full.json"
++echo "  . .venv/bin/activate && python -m harness.pipeline --config configs/l40_run_a.json"

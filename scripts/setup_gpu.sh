@@ -19,4 +19,4 @@ python -m pytest tests/test_harness.py -q
 echo
 echo "Ready. Run:"
 echo "  export LLAMA_SERVER=$PWD/.cache/llama.cpp/build/bin/llama-server"
-echo "  . .venv/bin/activate && python -m harness.pipeline --config configs/l40_full.json"
+echo "  . .venv/bin/activate && python -m harness.pipeline --config configs/l40_run_a.json"

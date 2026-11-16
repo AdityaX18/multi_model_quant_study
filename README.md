@@ -7,9 +7,10 @@ quantization levels, 840 BFCL items, four temperatures with repeated samples.
 ## One command
 ```bash
 python -m harness.pipeline --config configs/smoke.json      # laptop, ~6 min, 208 generations
-python -m harness.pipeline --config configs/l40_full.json   # big GPU, 299,880 generations (RUN_ON_GPU.md)
+python -m harness.pipeline --config configs/l40_run_a.json   # big GPU: 1.5B + 3B, 199,920 generations
+python -m harness.pipeline --config configs/l40_run_b.json   # big GPU: 7B, 99,960 generations (RUN_ON_GPU.md)
 ```
-Stages: check → fetch → preflight → generate → score → analyse → pack. Re-running skips finished work.
+Stages: check → preflight → generate → score → analyse → pack. Re-running skips finished work.
 
 ## Folder map
 | Path | What it does | Author |
@@ -32,7 +33,7 @@ Stages: check → fetch → preflight → generate → score → analyse → pac
 
 ## Data flow
 ```
-config ──► fetch ──► models/*.gguf
+config ──► one GGUF at a time into models/ (deleted after use when "delete_after_use" is set)
                          │
 items (bfcl.py) ──► generate (run_grid.py + llama.py) ──► results/<run>/generations.jsonl   raw outputs
                                                               │

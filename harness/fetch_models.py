@@ -40,6 +40,21 @@ def fetch(repo: str, stem: str, quant: str, dest: Path = MODELS) -> Path:
     return paths[0]
 
 
+def sizes(repo: str, stem: str, quants: list[str]) -> dict[str, int]:
+    """Bytes on disk for each quant level, read from the Hugging Face file listing (no download)."""
+    from huggingface_hub import list_repo_tree
+
+    tree = {f.path: f.size for f in list_repo_tree(repo) if f.path.endswith(".gguf")}
+    return {q: sum(tree[n] for n in files_for(list(tree), stem, q)) for q in quants}
+
+
+def remove(first_part: Path) -> None:
+    """Delete one quant level's file(s), all parts of a split file included."""
+    base = re.sub(r"(-\d{5}-of-\d{5})?\.gguf$", "", first_part.name)
+    for f in first_part.parent.glob(base + "*.gguf"):
+        f.unlink()
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", required=True)

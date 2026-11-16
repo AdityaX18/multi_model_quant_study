@@ -1,12 +1,12 @@
 """One command from nothing to results:
 
-  python -m harness.pipeline --config configs/l40_full.json
+  python -m harness.pipeline --config configs/l40_run_a.json
 
 Stages, in order (each one is skipped if its work is already on disk, so re-running is always safe):
   check      llama-server found, GPU visible, items load
-  fetch      download every GGUF in the config from Hugging Face into models/
-  preflight  24 items on the first model: are tool calls coming back at all, and how long will the full run take
+  preflight  24 items on the first model: are tool calls coming back at all, how long will the full run take
   generate   the full grid -> results/<name>/generations.jsonl            (harness/run_grid.py)
+             each GGUF is downloaded right before use; with "delete_after_use" it is deleted right after
   score      re-grade every row from the raw output -> scored.jsonl       (harness/score.py)
   analyse    tables and plots -> results/<name>/report/                    (core/analysis.py, YOURS)
   pack       results/<name>.tar.gz, the one file to send back
@@ -27,12 +27,12 @@ import time
 from pathlib import Path
 
 from . import bfcl
-from .fetch_models import fetch
+from .fetch_models import sizes
 from .run_grid import count, generate, items_for
 from .score import score
 
 ROOT = Path(__file__).resolve().parents[1]
-STAGES = ["check", "fetch", "preflight", "generate", "score", "analyse", "pack"]
+STAGES = ["check", "preflight", "generate", "score", "analyse", "pack"]
 
 
 def load_config(path: str) -> dict:
@@ -60,16 +60,7 @@ def stage_check(cfg: dict, out: Path) -> None:
     print(f"[check] GPU: {meta['gpu']}   items: {len(items_for(cfg))}   generations planned: {n:,}")
 
 
-def stage_fetch(cfg: dict) -> dict:
-    paths = {}
-    for m in cfg["models"]:
-        for q in m["quants"]:
-            paths[(m["name"], q)] = fetch(m["repo"], m["stem"], q)
-            print(f"[fetch] {m['name']} {q}: {paths[(m['name'], q)].name}")
-    return paths
-
-
-def stage_preflight(cfg: dict, out: Path, paths: dict) -> None:
+def stage_preflight(cfg: dict, out: Path) -> None:
     pf = out / "preflight.json"
     if pf.exists():
         print(f"[preflight] already done: {json.loads(pf.read_text())['summary']}")
@@ -78,7 +69,7 @@ def stage_preflight(cfg: dict, out: Path, paths: dict) -> None:
     small = dict(cfg, models=[dict(m, quants=[m["quants"][0]])],
                  items={c: 8 for c in cfg["items"]}, temperatures=[0, max(cfg["temperatures"])], samples=2, t0_repeats=1)
     t0 = time.time()
-    gen = generate(small, out, paths, gen_name="preflight.jsonl")
+    gen = generate(small, out, gen_name="preflight.jsonl", keep_models=True)
     secs = time.time() - t0
     rows = [json.loads(line) for line in gen.read_text().splitlines()]
     failed = sum(r["error"] == "request_failed" for r in rows)
@@ -86,17 +77,20 @@ def stage_preflight(cfg: dict, out: Path, paths: dict) -> None:
     relevant = sum(r["category"] != "irrelevance" for r in rows)
     per_gen = secs / max(len(rows), 1)
     # crude: assume time per generation grows with file size; good enough to decide whether it fits a night
-    ref_size = paths[(m["name"], m["quants"][0])].stat().st_size
-    est = 0.0
+    size = {mm["name"]: sizes(mm["repo"], mm["stem"], mm["quants"]) for mm in cfg["models"]}
+    ref_size = size[m["name"]][m["quants"][0]]
     n_per_quant = count(dict(cfg, models=[dict(m, quants=["x"])]))
-    for mm in cfg["models"]:
-        for q in mm["quants"]:
-            p = paths[(mm["name"], q)]
-            size = sum(f.stat().st_size for f in p.parent.glob(p.name.replace("-00001-of-", "-*-of-")))
-            est += n_per_quant * per_gen * max(size / ref_size, 0.3)
-    summary = (f"{len(rows)} generations in {secs:.0f} s ({per_gen:.2f} s each incl. model load); "
+    est = sum(n_per_quant * per_gen * max(b / ref_size, 0.3) for mm in size.values() for b in mm.values())
+    total_gb = sum(b for mm in size.values() for b in mm.values()) / 1e9
+    peak_gb = max(b for mm in size.values() for b in mm.values()) / 1e9
+    disk = (f"disk: {peak_gb:.0f} GB peak (one file at a time, deleted after use)" if cfg.get("delete_after_use")
+            else f"disk: {total_gb:.0f} GB (all files kept)")
+    summary = (f"{len(rows)} generations in {secs:.0f} s ({per_gen:.2f} s each incl. download and model load); "
                f"tool calls on {calls}/{relevant} non-irrelevance items; {failed} failed requests; "
-               f"full run estimate {est / 3600:.1f} h (rough)")
+               f"full run estimate {est / 3600:.1f} h (rough, upper bound); {disk}")
+    log = out / f"server-{m['name']}-{m['quants'][0]}.log"
+    offload = [ln for ln in log.read_text(errors="ignore").splitlines() if "offloaded" in ln and "layers" in ln]
+    print(f"[preflight] GPU offload: {offload[-1].strip() if offload else 'no offload line in server log'}")
     pf.write_text(json.dumps({"summary": summary, "seconds": secs, "rows": len(rows)}, indent=1))
     print(f"[preflight] {summary}")
     if failed > len(rows) * 0.1 or calls == 0:
@@ -152,15 +146,12 @@ def main(argv=None) -> None:
     out = ROOT / "results" / cfg["name"]
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    paths = {}
     if "check" in a.stages:
         stage_check(cfg, out)
-    if {"fetch", "preflight", "generate"} & set(a.stages):
-        paths = stage_fetch(cfg)
     if "preflight" in a.stages:
-        stage_preflight(cfg, out, paths)
+        stage_preflight(cfg, out)
     if "generate" in a.stages:
-        generate(cfg, out, paths)
+        generate(cfg, out)
     if "score" in a.stages:
         stage_score(out)
     if "analyse" in a.stages:

@@ -1,6 +1,6 @@
 # Same job in a container (needs the NVIDIA container toolkit on the host):
 #   docker build -t quant-toolcall .
-#   docker run --gpus all -v $PWD/results:/app/results -v $PWD/models:/app/models quant-toolcall configs/l40_full.json
+#   docker run --gpus all -v $PWD/results:/app/results -v $PWD/models:/app/models quant-toolcall configs/l40_run_a.json
 # Not yet tested on a GPU host: if the build fails, use scripts/setup_gpu.sh instead.
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential python3 python3-venv \
@@ -15,4 +15,4 @@ RUN git clone https://github.com/ggml-org/llama.cpp .cache/llama.cpp && git -C .
 COPY . .
 ENV LLAMA_SERVER=/app/.cache/llama.cpp/build/bin/llama-server
 ENTRYPOINT [".venv/bin/python", "-m", "harness.pipeline", "--config"]
-CMD ["configs/l40_full.json"]
+CMD ["configs/l40_run_a.json"]
